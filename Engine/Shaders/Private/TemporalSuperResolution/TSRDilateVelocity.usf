@@ -1,0 +1,209 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "TSRCommon.ush"
+
+
+//------------------------------------------------------- CONFIG
+
+#define TILE_SIZE 8
+
+#define AA_CROSS 1
+
+#define CONFIG_DEPTH_EDGE_DETECTION 1
+
+
+//------------------------------------------------------- PARAMETERS
+
+float2 PrevOutputBufferUVMin;
+float2 PrevOutputBufferUVMax;
+float WorldDepthToDepthError;
+
+Texture2D SceneDepthTexture;
+Texture2D SceneVelocityTexture;
+
+RWTexture2D<float2> DilatedVelocityOutput;
+RWTexture2D<float> ClosestDepthOutput;
+RWTexture2D<uint> PrevUseCountOutput;
+RWTexture2D<uint> PrevClosestDepthOutput;
+RWTexture2D<uint> ParallaxFactorOutput;
+
+
+//------------------------------------------------------- ENTRY POINT
+
+uint PackDepthAndOffset(const int2 Offset, float DeviceZ)
+{
+	return ((asuint(DeviceZ) << 2) & ~0xF) | (uint(1 + Offset.x) << 0) | (uint(1 + Offset.y) << 2);
+}
+
+void UnpackDepthAndOffset(uint Packed, out int2 Offset, out float DeviceZ)
+{
+	DeviceZ = asfloat((Packed & ~0xF) >> 2);
+	Offset.x = int((Packed >> 0) & 0x3) - 1;
+	Offset.y = int((Packed >> 2) & 0x3) - 1;
+}
+
+
+//------------------------------------------------------- ENTRY POINT
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	float4 Debug = 0.0;
+
+	uint2 DispatchThreadId = (
+		ZOrder2D(GroupThreadIndex, log2(TILE_SIZE)) +
+		GroupId * uint2(TILE_SIZE, TILE_SIZE));
+
+	uint2 InputPixelPos = InputInfo_ViewportMin + DispatchThreadId;
+	
+	float2 ViewportUV = (float2(DispatchThreadId) + 0.5f) * InputInfo_ViewportSizeInverse;
+	float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+	float2 InputBufferUV = (InputPixelPos + 0.5) * InputInfo_ExtentInverse;
+
+	float DeviceZ = SceneDepthTexture[InputPixelPos].r;
+
+	float ClosestDeviceZ = DeviceZ;
+	float2 VelocityPixelOffset = float2(0.0, 0.0);
+	float ParallaxFactorForHistory = 1.0;
+	float ParallaxFactorForHistoryRejection = 1.0;
+	#if AA_CROSS
+	{
+		const int2 kOffsets[4] = {
+			int2( 1,  0),
+			int2( 1,  1),
+			int2( 0,  1),
+			int2(-1,  1),
+		};
+
+		uint PackedDepthOffset = PackDepthAndOffset(/* Offset = */ int2(0, 0), DeviceZ);
+		
+		float FurthestPairDeviceZ = DeviceZ;
+		float FurthestDeviceZ = DeviceZ;
+
+		float DeviceZError;
+		{
+			float Depth = ConvertFromDeviceZ(DeviceZ);
+			float ErrorCorrectedDeviceZ = ConvertToDeviceZ(Depth + Depth * WorldDepthToDepthError);
+			DeviceZError = abs(ErrorCorrectedDeviceZ - DeviceZ);
+		}
+
+		#if 1
+			UNROLL_N(4)
+			for (uint i = 0; i < 4; i++)
+		#else
+			UNROLL_N(2)
+			for (uint i = 1; i < 4; i+= 2)
+		#endif
+		{
+			const int2 Offset = kOffsets[i];
+
+			float SampleDeviceZ0 = SceneDepthTexture[int2(InputPixelPos) + Offset].r;
+			float SampleDeviceZ1 = SceneDepthTexture[int2(InputPixelPos) - Offset].r;
+			
+			#if CONFIG_DEPTH_EDGE_DETECTION
+			{
+				float DepthDiff = abs(SampleDeviceZ1 - SampleDeviceZ0);
+				float DepthVariation = (SampleDeviceZ0 + SampleDeviceZ1) * 0.5 - DeviceZ;
+
+				FLATTEN
+				if (DepthVariation > max(DepthDiff * 0.25, DeviceZError))
+				{
+					PackedDepthOffset = max(PackedDepthOffset, PackDepthAndOffset(+Offset, SampleDeviceZ0));
+					PackedDepthOffset = max(PackedDepthOffset, PackDepthAndOffset(-Offset, SampleDeviceZ1));
+				}
+			}
+			#else
+			{
+				PackedDepthOffset = max(PackedDepthOffset, PackDepthAndOffset(+Offset, SampleDeviceZ0));
+				PackedDepthOffset = max(PackedDepthOffset, PackDepthAndOffset(-Offset, SampleDeviceZ1));
+			}
+			#endif
+
+			FurthestPairDeviceZ = min(FurthestPairDeviceZ, max(SampleDeviceZ0, SampleDeviceZ1));
+			FurthestDeviceZ = min(FurthestDeviceZ, min(SampleDeviceZ0, SampleDeviceZ1));
+		}
+
+		ParallaxFactorForHistory = clamp(DeviceZ / FurthestPairDeviceZ, 0.0, MAX_PARALLAX_FACTOR);
+		ParallaxFactorForHistoryRejection = clamp(DeviceZ / FurthestDeviceZ, 0.0, MAX_PARALLAX_FACTOR);
+
+		UnpackDepthAndOffset(PackedDepthOffset, /* out */ VelocityPixelOffset, /* out */ ClosestDeviceZ);
+	}
+	#endif
+	
+	// Camera motion for pixel.
+	float2 FinalScreenVelocity = 0.0;
+
+	// Compute final screen vecocity.
+	#if 1
+	{
+		FinalScreenVelocity = ComputeStaticVelocity(ScreenPos, ClosestDeviceZ);
+
+		#if 1
+		{
+			float4 EncodedVelocity = SceneVelocityTexture[uint2(InputBufferUV * InputInfo_Extent + VelocityPixelOffset)];
+			if (EncodedVelocity.x > 0.0)
+			{
+				FinalScreenVelocity = DecodeVelocityFromTexture(EncodedVelocity).xy;
+			}
+		}
+		#endif
+	}
+	#endif
+
+	// Scatter parallax rejection
+	float2 PrevScreenPos = ScreenPos - FinalScreenVelocity;
+	float2 PrevInputBufferUV = (InputInfo_ScreenPosToViewportScale * PrevScreenPos + InputInfo_ScreenPosToViewportBias) * InputInfo_ExtentInverse;
+
+
+	Debug.rg = VelocityPixelOffset * 0.5 + 0.5;
+
+	if (all(InputPixelPos < InputInfo_ViewportMax))
+	{
+		#if 1
+		{
+			bool bValidHistoryCoord = all(PrevInputBufferUV > PrevOutputBufferUVMin && PrevInputBufferUV < PrevOutputBufferUVMax);
+
+			FBilinearSampleInfos BilinearInter = GetBilinearSampleLevelInfos(PrevInputBufferUV, InputInfo_Extent, InputInfo_ExtentInverse);
+
+			UNROLL_N(4)
+			for (uint i = 0; i < 4; i++)
+			{
+				float Weight = GetSampleWeight(BilinearInter, i);
+				uint2 PixelPos = GetSamplePixelCoord(BilinearInter, i);
+
+				uint FinalAdd = uint(round(Weight * PREV_USE_COUNT_QUANTIZATION));
+			
+				PixelPos.x = ((FinalAdd > 0) && bValidHistoryCoord) ? PixelPos.x : (~0);
+
+				#if COMPRESS_PREV_USE_COUNT
+					uint2 CompressedUseCountPixelPos;
+					uint Shift;
+					ComputeCompressedUseCountPixelCoordinates(PixelPos, /* out */ CompressedUseCountPixelPos, /* out */ Shift);
+
+					FinalAdd = FinalAdd << (8 * Shift);
+				#else
+					uint2 CompressedUseCountPixelPos = PixelPos;
+				#endif
+
+				InterlockedAdd(PrevUseCountOutput[CompressedUseCountPixelPos], FinalAdd);
+				InterlockedMax(PrevClosestDepthOutput[PixelPos], f32tof16(ClosestDeviceZ));
+			}
+		}
+		#endif
+		
+		float4 EncodedVelocity = SceneVelocityTexture[uint2(InputBufferUV * InputInfo_Extent)];
+		
+		//DilatedVelocityOutput[InputPixelPos] = EncodedVelocity.xy; //EncodeVelocityToTexture(float3(FinalScreenVelocity, 0.0)).xy;
+		DilatedVelocityOutput[InputPixelPos] = EncodeVelocityToTexture(float3(FinalScreenVelocity, 0.0)).xy;
+		ClosestDepthOutput[InputPixelPos] = ClosestDeviceZ;
+		ParallaxFactorOutput[InputPixelPos] = CompressParallaxFactor(ParallaxFactorForHistory) | (CompressParallaxFactor(ParallaxFactorForHistoryRejection) << 4);
+
+		#if DEBUG_OUTPUT
+		{
+			DebugOutput[InputPixelPos] = Debug;
+		}
+		#endif
+	}
+}

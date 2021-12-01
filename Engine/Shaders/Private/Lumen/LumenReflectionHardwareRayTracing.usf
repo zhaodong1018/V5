@@ -1,0 +1,400 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../MonteCarlo.ush"
+#include "../SceneTextureParameters.ush"
+
+#include "LumenCardCommon.ush"
+#include "LumenTracingCommon.ush"
+#include "LumenReflectionCommon.ush"
+#include "LumenVisualizeTraces.ush"
+#include "LumenRadianceCacheCommon.ush"
+
+#ifndef THREADGROUP_SIZE_2D
+#define THREADGROUP_SIZE_2D 8
+#endif
+
+#ifndef THREADGROUP_SIZE_1D
+#define THREADGROUP_SIZE_1D THREADGROUP_SIZE_2D * THREADGROUP_SIZE_2D
+#endif
+
+#define LIGHTING_MODE_SURFACE_CACHE 0
+#define LIGHTING_MODE_HIT_LIGHTING 1
+
+/**
+ * TraceData can represent three types of rays:
+ * 1) Rays that hit an object with a valid surface-cache entry
+ * 2) Rays that hit an object with an invalid surface-cache entry
+ * 3) Rays that do not hit an object after having traveled 'TraceDistance' units
+ *
+ * NOTE: Miss rays need additional data and must be determined by the caller.
+ */
+struct FTraceData
+{
+	float TraceDistance;
+	uint MaterialId;
+
+	bool bIsHit;
+	bool bIsValidMeshCardIndex;
+	bool bIsFarField;
+};
+
+struct FTraceDataPacked
+{
+	uint PackedData[2];
+};
+
+FTraceData CreateTraceData(float TraceDistance, uint MaterialId, bool bIsHit, bool bIsValidMeshCardIndex, bool bIsFarField)
+{
+	FTraceData TraceData;
+	TraceData.TraceDistance = TraceDistance;
+	TraceData.MaterialId = MaterialId;
+	TraceData.bIsHit = bIsHit;
+	TraceData.bIsValidMeshCardIndex = bIsValidMeshCardIndex;
+	TraceData.bIsFarField = bIsFarField;
+
+	return TraceData;
+}
+
+FTraceDataPacked PackTraceData(FTraceData TraceData)
+{
+	FTraceDataPacked TraceDataPacked;
+	TraceDataPacked.PackedData[0] =
+		(asint(TraceData.TraceDistance) & 0xFFFFFFF8)
+		| (TraceData.bIsHit & 0x01)
+		| ((TraceData.bIsValidMeshCardIndex & 0x01) << 1)
+		| ((TraceData.bIsFarField & 0x01) << 2);
+	TraceDataPacked.PackedData[1] = TraceData.MaterialId;
+
+	return TraceDataPacked;
+}
+
+FTraceData UnpackTraceData(FTraceDataPacked TraceDataPacked)
+{
+	FTraceData TraceData;
+	TraceData.TraceDistance = asfloat(asint(TraceDataPacked.PackedData[0] & 0xFFFFFFF8));
+	TraceData.bIsHit = (TraceDataPacked.PackedData[0] & 0x01) != 0;
+	TraceData.bIsValidMeshCardIndex = (TraceDataPacked.PackedData[0] & 0x02) != 0;
+	TraceData.bIsFarField = (TraceDataPacked.PackedData[0] & 0x04) != 0;
+	TraceData.MaterialId = TraceDataPacked.PackedData[1];
+
+	return TraceData;
+}
+
+Buffer<int> RayAllocator;
+RWBuffer<uint> RWCompactRaysIndirectArgs;
+
+[numthreads(1, 1, 1)]
+void FLumenReflectionCompactRaysIndirectArgsCS()
+{
+	RWCompactRaysIndirectArgs[0] = (RayAllocator[0] + THREADGROUP_SIZE_1D - 1) / THREADGROUP_SIZE_1D;
+	RWCompactRaysIndirectArgs[1] = 1;
+	RWCompactRaysIndirectArgs[2] = 1;
+}
+
+RWBuffer<int> RWRayAllocator;
+
+Buffer<uint2> TraceTexelDataPacked;
+RWBuffer<uint2> RWTraceTexelDataPacked;
+
+StructuredBuffer<FTraceDataPacked> TraceDataPacked;
+RWStructuredBuffer<FTraceDataPacked> RWTraceDataPacked;
+
+groupshared uint SharedRayAllocator;
+groupshared uint SharedGroupOffset;
+groupshared uint2 SharedTraceTexelDataPacked[THREADGROUP_SIZE_1D];
+groupshared FTraceDataPacked SharedTraceDataPacked[THREADGROUP_SIZE_1D];
+
+#define COMPACT_MODE_HIT_LIGHTING_RETRACE 0
+#define COMPACT_MODE_FAR_FIELD_RETRACE 1
+#define COMPACT_MODE_FORCE_HIT_LIGHTING 2
+#define COMPACT_MODE_APPEND_RAYS 3
+
+[numthreads(THREADGROUP_SIZE_1D, 1, 1)]
+void FLumenReflectionCompactRaysCS(
+	uint GroupThreadId : SV_GroupThreadID,
+	uint DispatchThreadId : SV_DispatchThreadID)
+{
+	SharedRayAllocator = 0;
+	GroupMemoryBarrierWithGroupSync();
+
+	uint RayIndex = DispatchThreadId;
+	FTraceData TraceData = UnpackTraceData(TraceDataPacked[RayIndex]);
+#if DIM_COMPACT_MODE == COMPACT_MODE_HIT_LIGHTING_RETRACE
+	bool bIsRayValid = TraceData.bIsHit && !TraceData.bIsValidMeshCardIndex;
+#elif DIM_COMPACT_MODE == COMPACT_MODE_FORCE_HIT_LIGHTING
+	bool bIsRayValid = TraceData.bIsHit;
+#elif DIM_COMPACT_MODE == COMPACT_MODE_FAR_FIELD_RETRACE
+	bool bIsRayValid = !TraceData.bIsHit;
+#else // COMPACT_MODE_APPEND_RAYS
+	bool bIsRayValid = true;
+#endif // DIM_COMPACT_MODE
+	if (bIsRayValid)
+	{
+		// Allocate rays to re-trace with hit lighting
+		uint ThreadOffset;
+		InterlockedAdd(SharedRayAllocator, 1, ThreadOffset);
+
+		SharedTraceTexelDataPacked[ThreadOffset] = TraceTexelDataPacked[RayIndex];
+		SharedTraceDataPacked[ThreadOffset] = TraceDataPacked[RayIndex];
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (GroupThreadId == 0)
+	{
+		InterlockedAdd(RWRayAllocator[0], SharedRayAllocator, SharedGroupOffset);
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (GroupThreadId < SharedRayAllocator)
+	{
+		RWTraceTexelDataPacked[SharedGroupOffset + GroupThreadId] = SharedTraceTexelDataPacked[GroupThreadId];
+		RWTraceDataPacked[SharedGroupOffset + GroupThreadId] = SharedTraceDataPacked[GroupThreadId];
+	}
+}
+
+RWBuffer<uint> RWBucketRaysByMaterialIdIndirectArgs;
+
+#ifndef ELEMENTS_PER_THREAD
+#define ELEMENTS_PER_THREAD 16
+#endif // ELEMENTS_PER_THREAD
+
+[numthreads(1, 1, 1)]
+void FLumenReflectionBucketRaysByMaterialIdIndirectArgsCS()
+{
+	const uint ElementsPerGroup = THREADGROUP_SIZE_1D * ELEMENTS_PER_THREAD;
+	RWBucketRaysByMaterialIdIndirectArgs[0] = (RayAllocator[0] + ElementsPerGroup - 1) / ElementsPerGroup;
+	RWBucketRaysByMaterialIdIndirectArgs[1] = 1;
+	RWBucketRaysByMaterialIdIndirectArgs[2] = 1;
+}
+
+#define NUM_BINS (THREADGROUP_SIZE_1D / 2)
+groupshared uint BinSize[NUM_BINS];
+groupshared uint BinOffset[NUM_BINS];
+
+#define NUM_ELEMENTS THREADGROUP_SIZE_1D * ELEMENTS_PER_THREAD
+
+[numthreads(THREADGROUP_SIZE_1D, 1, 1)]
+void FLumenReflectionBucketRaysByMaterialIdCS(
+	uint GroupId : SV_GroupID,
+	uint GroupThreadId : SV_GroupThreadID)
+{
+	const uint GroupOffset = GroupId * NUM_ELEMENTS;
+
+	if (GroupThreadId < NUM_BINS)
+	{
+		BinSize[GroupThreadId] = 0;
+		BinOffset[GroupThreadId] = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	uint Hash[NUM_ELEMENTS / THREADGROUP_SIZE_1D];
+	uint2 TraceTexelDataPackedCache[NUM_ELEMENTS / THREADGROUP_SIZE_1D];
+	FTraceData TraceDataCache[NUM_ELEMENTS / THREADGROUP_SIZE_1D];
+
+	for (int i = GroupThreadId; i < NUM_ELEMENTS; i += THREADGROUP_SIZE_1D)
+	{
+		uint RayIndex = GroupOffset + i;
+		if (RayIndex < RayAllocator[0])
+		{
+			TraceTexelDataPackedCache[i / THREADGROUP_SIZE_1D] = TraceTexelDataPacked[RayIndex];
+			TraceDataCache[i / THREADGROUP_SIZE_1D] = UnpackTraceData(TraceDataPacked[RayIndex]);
+			uint BinIndex = TraceDataCache[i / THREADGROUP_SIZE_1D].MaterialId % NUM_BINS;
+
+			InterlockedAdd(BinSize[BinIndex], 1, Hash[i / THREADGROUP_SIZE_1D]);
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (GroupThreadId < NUM_BINS)
+	{
+		for (int i = 0; i < GroupThreadId; ++i)
+		{
+			BinOffset[GroupThreadId] += BinSize[i];
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	for (int i = GroupThreadId; i < NUM_ELEMENTS; i += THREADGROUP_SIZE_1D)
+	{
+		uint RayIndex = GroupOffset + i;
+		if (RayIndex < RayAllocator[0])
+		{
+			uint BinIndex = TraceDataCache[i / THREADGROUP_SIZE_1D].MaterialId % NUM_BINS;
+			uint OutputIndex = GroupOffset + BinOffset[BinIndex] + Hash[i / THREADGROUP_SIZE_1D];
+
+			RWTraceTexelDataPacked[OutputIndex] = TraceTexelDataPackedCache[i / THREADGROUP_SIZE_1D];
+			RWTraceDataPacked[OutputIndex] = PackTraceData(TraceDataCache[i / THREADGROUP_SIZE_1D]);
+		}
+	}
+}
+
+RWBuffer<uint> RWHardwareRayTracingIndirectArgs;
+
+[numthreads(1, 1, 1)]
+void FLumenReflectionHardwareRayTracingIndirectArgsCS()
+{
+	RWHardwareRayTracingIndirectArgs[0] = RayAllocator[0];
+	RWHardwareRayTracingIndirectArgs[1] = 1;
+	RWHardwareRayTracingIndirectArgs[2] = 1;
+}
+
+#if LUMEN_HARDWARE_RAYTRACING
+
+float3 FarFieldReferencePos;
+
+#include "LumenHardwareRayTracingCommon.ush"
+
+RaytracingAccelerationStructure TLAS;
+
+uint ThreadCount;
+uint GroupCount;
+int NearFieldLightingMode;
+float MaxTraceDistance;
+float FarFieldMaxTraceDistance;
+float PullbackBias;
+int MaxTranslucentSkipCount;
+
+RWTexture2D<float3> RWTraceRadiance;
+RWTexture2D<float> RWTraceHit;
+
+RAY_TRACING_ENTRY_RAYGEN(LumenReflectionHardwareRayTracingRGS)
+{
+	uint ThreadIndex = DispatchRaysIndex().x;
+	uint GroupIndex = DispatchRaysIndex().y;
+
+#if DIM_INDIRECT_DISPATCH
+	uint Iteration = 0;
+	uint DispatchedThreads = RayAllocator[0];
+#else
+	uint DispatchedThreads = ThreadCount * GroupCount;
+	uint IterationCount = (RayAllocator[0] + DispatchedThreads - 1) / DispatchedThreads;
+	for (uint Iteration = 0; Iteration < IterationCount; ++Iteration)
+#endif
+	{
+		uint RayIndex = Iteration * DispatchedThreads + GroupIndex * ThreadCount + ThreadIndex;
+		if (RayIndex >= RayAllocator[0])
+		{
+			return;
+		}
+
+		uint2 TraceCoord;
+		float TraceHitDistance = 0;
+		DecodeTraceTexel(TraceTexelDataPacked[RayIndex], TraceCoord, TraceHitDistance);
+
+		float2 ScreenUV = GetScreenUVFromReflectionTracingCoord(TraceCoord);
+		float2 ScreenCoord = ScreenUV * View.BufferSizeAndInvSize.xy;
+		uint LinearCoord = ScreenCoord.y * View.BufferSizeAndInvSize.x + ScreenCoord.x;
+
+		float SceneDepth = DownsampledDepth.Load(int3(TraceCoord, 0)).x;
+		float3 WorldPosition = GetWorldPositionFromScreenUV(ScreenUV, SceneDepth);
+		float3 WorldNormal = DecodeNormal(GBufferATexture.Load(int3(ScreenUV * View.BufferSizeAndInvSize.xy, 0)).xyz);
+
+		FRayData RayData = GetRayData(TraceCoord);
+
+		RayDesc Ray;
+		Ray.Origin = WorldPosition;
+		Ray.Direction = RayData.Direction;
+		float RayBias = 0.05;
+		Ray.TMin = max(TraceHitDistance - PullbackBias, RayBias);
+		Ray.TMax = RayData.TraceDistance;
+
+		float NormalBias = 0.05;
+		ApplyPositionBias(Ray.Origin, Ray.Direction, WorldNormal, NormalBias);
+
+		FRayCone RayCone = (FRayCone)0;
+		RayCone.SpreadAngle = View.EyeToPixelSpreadAngle;
+		RayCone = PropagateRayCone(RayCone, RayData.ConeHalfAngle, SceneDepth);
+
+		const bool bHiResSurface = true;
+		const bool bCullBackFacingTriangles = true;
+		FRayTracedLightingContext Context = CreateRayTracedLightingContext(TLAS, RayCone, TraceCoord, LinearCoord, bCullBackFacingTriangles, MaxTranslucentSkipCount, bHiResSurface);
+		Context.FarFieldMaxTraceDistance = FarFieldMaxTraceDistance;
+		Context.FarFieldReferencePos = FarFieldReferencePos;
+
+#if DIM_LIGHTING_MODE == LIGHTING_MODE_HIT_LIGHTING
+		FTraceData TraceData = UnpackTraceData(TraceDataPacked[RayIndex]);
+		if (TraceData.bIsFarField)
+		{
+			Context.InstanceMask = RAY_TRACING_MASK_FAR_FIELD;
+			Ray.TMax = FarFieldMaxTraceDistance;
+		}
+		const float Epsilon = 0.5;
+		Ray.TMin = TraceData.TraceDistance - Epsilon;
+
+		int LightingMode = (TraceData.bIsFarField || !TraceData.bIsValidMeshCardIndex) ?
+			EVALUATE_MATERIAL_AND_DIRECT_LIGHTING_AND_SKY_LIGHTING :
+			NearFieldLightingMode;
+		LightingMode = EVALUATE_MATERIAL_AND_DIRECT_LIGHTING_AND_SKY_LIGHTING;
+		FRayTracedLightingResult Result = TraceAndCalculateRayTracedLighting(Ray, Context, LightingMode);
+
+#else // DIM_LIGHTING_MODE == LIGHTING_MODE_SURFACE_CACHE
+		FRayTracedLightingResult Result = TraceAndCalculateRayTracedLightingFromSurfaceCache(Ray, Context);
+
+#endif // DIM_LIGHTING_MODE
+
+#if DIM_WRITE_FINAL_LIGHTING
+		if (!Result.bIsHit)
+		{
+			FConeTraceResult TraceResult;
+			TraceResult.Lighting = Result.Radiance;
+			TraceResult.Transparency = 1;
+
+#if DIM_RADIANCE_CACHE
+			if (RayData.TraceDistance < MaxTraceDistance * .99f)
+			{
+				SampleRadianceCacheAndApply(WorldPosition, RayData.Direction, RayData.ConeHalfAngle, float3(0, 0, 0), TraceResult.Lighting, TraceResult.Transparency);
+
+				Result.TraceHitDistance = RayData.TraceDistance;
+			}
+			else
+#endif
+			{
+				Result.TraceHitDistance = MaxTraceDistance;
+				EvaluateSkyRadianceForCone(RayData.Direction, tan(RayData.ConeHalfAngle), TraceResult);
+			}
+
+			Result.Radiance = TraceResult.Lighting;
+			Result.bIsHit = true;
+		}
+#endif // DIM_LIGHTING_MODE
+
+#if DIM_LIGHTING_MODE == LIGHTING_MODE_SURFACE_CACHE
+		RWTraceDataPacked[RayIndex] = PackTraceData(CreateTraceData(Result.TraceHitDistance, Result.MaterialShaderIndex, Result.bIsHit, Result.MeshCardsIndex != LUMEN_INVALID_CARD_INDEX, Result.bIsFarField));
+#endif // DIM_LIGHTING_MODE
+
+#if DIM_WRITE_FINAL_LIGHTING
+		Result.Radiance *= View.PreExposure;
+
+		float MaxLighting = max3(Result.Radiance.x, Result.Radiance.y, Result.Radiance.z);
+
+		if (MaxLighting > MaxRayIntensity)
+		{
+			Result.Radiance *= MaxRayIntensity / MaxLighting;
+		}
+
+		RWTraceRadiance[TraceCoord] = Result.Radiance;
+		RWTraceHit[TraceCoord] = EncodeRayDistance(Result.TraceHitDistance, Result.bIsHit);
+
+		#define DEBUG_SUPPORT_VISUALIZE_TRACE_COHERENCY 0
+		#if DEBUG_SUPPORT_VISUALIZE_TRACE_COHERENCY
+			if (VisualizeTraceCoherency != 0)
+			{
+				uint DebugGroupIndex = 10240;
+				// UE_RAY_TRACING_DISPATCH_1D
+				int DebugTraceIndex = (int)RayIndex - (int)DebugGroupIndex * 32;
+
+				if (DebugTraceIndex >= 0 && DebugTraceIndex < 32)
+				{
+					WriteTraceForVisualization(DebugTraceIndex, WorldPosition, RayData.Direction, Result.TraceHitDistance, /*Result.Radiance*/float3(1, 0, 0));
+				}
+			}
+		#endif
+#endif // DIM_WRITE_FINAL_LIGHTING
+	}
+}
+
+#endif // LUMEN_HARDWARE_RAYTRACING

@@ -1,0 +1,64 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct FHairTransmittanceMask
+{
+	float HairCount;
+	float Visibility;
+};
+
+FHairTransmittanceMask InitHairTransmittanceMask()
+{
+	FHairTransmittanceMask Out;
+	Out.HairCount = 0;
+	Out.Visibility = 1;
+	return Out;
+}
+
+FHairTransmittanceMask InitHairTransmittanceMask(float HairCount, float Visibility)
+{
+	FHairTransmittanceMask Out;
+	Out.HairCount = HairCount;
+	Out.Visibility = Visibility;
+	return Out;
+}
+
+uint PackTransmittanceMask(FHairTransmittanceMask In)
+{
+	return min(uint(In.HairCount * 1000), uint(0x00FFFFFF)) | (min(uint(In.Visibility * 0xFF), uint(0xFF)) << 24);
+}
+
+uint InitNullPackedHairTransmittanceMask()
+{
+	return 0;
+}
+
+FHairTransmittanceMask UnpackTransmittanceMask(uint In)
+{
+	FHairTransmittanceMask Out;
+	Out.HairCount = float(In & 0x00FFFFFF) / 1000.f;
+	Out.Visibility = float((In & 0xFF000000) >> 24) / 255.f;
+	return Out;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct FTransmittanceSettings
+{
+	int2	 DeepShadowResolution;
+	int2	 DeepShadowOffset;
+	float4x4 WorldToLightTransform;
+	float3   LightDirection;
+	float4   LightPosition;
+
+	float    DeepShadowDepthBiasScale;
+	float    DeepShadowDensityScale;
+	float	 TransmittanceKernelApertureInDegree;
+	float3   Random;
+	uint	 DebugMode;
+
+	uint TransmittanceKernelType;
+};

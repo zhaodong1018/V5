@@ -1,0 +1,117 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#if HAIR_CARD_MESH_FACTORY
+
+#include "/Engine/Private/HairStrands/HairStrandsVertexFactoryCommon.ush"
+
+////////////////////////////////////////////////////////////////////////////////
+
+struct FHairVertexAttributes
+{
+	float2 HairUV;
+	float2 HairRootUV;
+	float2 HairDimensions;
+	float3 HairBaseColor;
+	float  HairSeed;
+	float  HairRoughness;
+};
+
+float GetHairStrandsDepth(float2 InAtlasUV, float InDeviceZ)
+{
+	InAtlasUV.y = HairCardsVF.bInvertUV ? 1 - InAtlasUV.y : InAtlasUV.y;
+	const float SceneDepthOffset = Texture2DSample(HairCardsVF.DepthTexture, HairCardsVF.DepthSampler, InAtlasUV).x;
+	const float SceneDepth = ConvertFromDeviceZ(InDeviceZ);
+
+	return ConvertToDeviceZ(SceneDepth + SceneDepthOffset);
+}
+
+float3 GetHairStrandsTangent(float2 InAtlasUV, half3x3 TangentToWorld, bool bUseTangentSpace)
+{
+	InAtlasUV.y = HairCardsVF.bInvertUV ? 1 - InAtlasUV.y : InAtlasUV.y;
+	const float3 LocalTangent = Texture2DSample(HairCardsVF.TangentTexture, HairCardsVF.TangentSampler, InAtlasUV).xyz * 2 - 1;
+	const float3 WorldTangent = mul(LocalTangent, TangentToWorld);
+	return bUseTangentSpace ? LocalTangent : WorldTangent;
+}
+
+float GetHairStrandsCoverage(float2 InAtlasUV)
+{
+	InAtlasUV.y = HairCardsVF.bInvertUV ? 1 - InAtlasUV.y : InAtlasUV.y;
+	return Texture2DSample(HairCardsVF.CoverageTexture, HairCardsVF.CoverageSampler, InAtlasUV).x;
+}
+
+FHairVertexAttributes GetHairStrandsAttributes(float2 InAtlasUV, float2 InRootUV = float2(0, 0), float InCardLength = 0.f)
+{
+	InAtlasUV.y = HairCardsVF.bInvertUV ? 1 - InAtlasUV.y : InAtlasUV.y;
+	const float4 Value = Texture2DSample(HairCardsVF.AttributeTexture, HairCardsVF.AttributeSampler, InAtlasUV);
+	const float CoordU = Value.z;
+	const float Seed = Value.w;
+	const float WorldRadius = 0.01f; // Hardcoded for cards
+	const float WorldLength = InCardLength;
+	
+	// Invert V to compensate image origin flip
+	// Similar to DecodeHairAttribute in HairStrandVertexFactoryCommon.ush
+	InRootUV.y = 1.0 - InRootUV.y;
+
+	FHairVertexAttributes Out;
+	Out.HairUV = float2(CoordU, 0.5f);
+	Out.HairRootUV = HairCardsVF.bUseTextureRootUV ? Value.xy : InRootUV;
+	Out.HairDimensions = float2(WorldLength, WorldRadius);
+	Out.HairBaseColor = 0;
+	Out.HairSeed = Seed;
+	Out.HairRoughness = 0;
+	return Out;
+}
+
+float4 GetHairStrandsAuxilaryData(float2 HairPrimitiveUV)
+{
+	return Texture2DSample(HairCardsVF.AuxilaryDataTexture, HairCardsVF.AuxilaryDataSampler, HairPrimitiveUV);
+}
+
+float2 GetHairStrandsUV(float2 HairPrimitiveUV)
+{
+	return GetHairStrandsAttributes(HairPrimitiveUV).HairUV;
+}
+
+float2 GetHairStrandsDimensions(float2 HairPrimitiveUV, float HairPrimitiveLength)
+{
+	return GetHairStrandsAttributes(HairPrimitiveUV, float2(0, 0), HairPrimitiveLength).HairDimensions;
+}
+
+float2 GetHairStrandsRootUV(float2 HairPrimitiveUV, float2 InRootUV)
+{
+	// Invert V to compensate image origin flip
+	// Similar to DecodeHairAttribute in HairStrandVertexFactoryCommon.ush
+	InRootUV.y = 1.0 - InRootUV.y; 
+
+	// If VF use texture data (for helmet/meshes), fetch root UV from the attribute texture
+	if (HairCardsVF.bUseTextureRootUV)
+	{
+		InRootUV = Texture2DSample(HairCardsVF.AttributeTexture, HairCardsVF.AttributeSampler, HairPrimitiveUV).xy;
+	}
+	return InRootUV;
+}
+
+float  GetHairStrandsSeed(float2 HairPrimitiveUV)
+{
+	return GetHairStrandsAttributes(HairPrimitiveUV).HairSeed;
+}
+
+float3 GetHairStrandsBaseColor(float2 HairPrimitiveUV)
+{
+	return GetHairStrandsAttributes(HairPrimitiveUV).HairBaseColor;
+}
+
+float GetHairStrandsRoughness(float2 HairPrimitiveUV)
+{
+	return GetHairStrandsAttributes(HairPrimitiveUV).HairRoughness;
+}
+
+float GetHairStrandsGroupIndex(float2 InAtlasUV)
+{
+	return HairCardsVF.GroupIndex; 
+}
+////////////////////////////////////////////////////////////////////////////////
+
+#endif // HAIR_CARD_MESH_FACTORY

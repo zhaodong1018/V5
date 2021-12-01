@@ -1,0 +1,63 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+// Includes
+#include "Net/Core/Analytics/NetAnalytics.h"
+#include "Net/Core/Connection/NetCloseResult.h"
+
+
+/**
+ * Container class for separating analytics variables and processing, from the main NetConnection code
+ */
+struct FNetConnAnalyticsVars
+{
+	using FNetResult = UE::Net::FNetResult;
+
+public:
+	/** Default constructor */
+	FNetConnAnalyticsVars();
+
+	bool operator == (const FNetConnAnalyticsVars& A) const;
+
+	void CommitAnalytics(FNetConnAnalyticsVars& AggregatedData);
+
+
+public:
+	/** The number of packets that were exclusively ack packets */
+	uint64 OutAckOnlyCount;
+
+	/** The number of packets that were just keep-alive packets */
+	uint64 OutKeepAliveCount;
+
+	/** The result/reason for triggering NetConnection Close (local) */
+	TUniquePtr<FNetResult> CloseReason;
+
+	/** The remotely-communicated result/reason for triggering NetConnection Close (remote, server only) */
+	TArray<FString> ClientCloseReasons;
+
+	/** NetConnection faults that were recovered from, and the number of times they were recovered from */
+	TMap<FString, int32> RecoveredFaults;
+
+
+	/** Aggregation variables */
+
+	struct FPerNetConnData
+	{
+		TUniquePtr<FNetResult> CloseReason;
+		TArray<FString> ClientCloseReasons;
+	};
+
+	/** (Not filled until final commit) Contains Per-NetConnection data which can't be aggregated until final commit */
+	TArray<FPerNetConnData> PerConnectionData;
+};
+
+
+/**
+ * NetConnection implementation for basic aggregated net analytics data
+ */
+struct FNetConnAnalyticsData : public TBasicNetAnalyticsData<FNetConnAnalyticsVars>
+{
+public:
+	virtual void SendAnalytics() override;
+};

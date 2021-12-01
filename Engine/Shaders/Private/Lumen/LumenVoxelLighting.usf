@@ -1,0 +1,522 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	LumenVoxelLighting.usf
+=============================================================================*/
+
+#include "../Common.ush"
+#include "LumenCardCommon.ush"
+
+// 16 bit render target accumulation
+#define DEPTH_WEIGHTED_OIT_32_BIT 0
+// Faster to always trace highest resolution mip for short voxelization traces, there's rarely empty space to skip
+#define SDF_TRACING_TRAVERSE_MIPS 0
+// Pick best sample instead of using stochastic
+#define SURFACE_CACHE_SAMPLING_METHOD SURFACE_CACHE_SAMPLING_METHOD_BEST_SAMPLE
+#include "LumenTracingCommon.ush"
+
+#ifndef THREADGROUP_SIZE
+	#define THREADGROUP_SIZE 1
+#endif
+
+#define NUM_VOXEL_DIRECTIONS 6
+#define VIS_BUFFER_TILE_SIZE 4
+#define VIS_BUFFER_SHADING_WAVE_SIZE 64
+
+struct FVoxelVisBuffer
+{
+	float NormalizedHitDistance;
+	uint HitObjectId;
+};
+
+#define VIS_BUFFER_INVALID	0
+#define VIS_BUFFER_CLEAR	0xFFFFFFFF
+
+uint EncodeVoxelVisBuffer(FVoxelVisBuffer VisBuffer)
+{
+	uint HitDistanceUInt = uint(saturate(VisBuffer.NormalizedHitDistance) * 0xFF) & 0xFF;
+	uint HitObjectUInt = VisBuffer.HitObjectId & 0xFFFFFF;
+
+	uint Payload = (HitDistanceUInt << 24) | HitObjectUInt;
+
+	// Don't collide with VIS_BUFFER_INVALID
+	Payload = max(Payload, 1U);
+
+	return Payload;
+}
+
+FVoxelVisBuffer DecodeVoxelVisBuffer(uint Payload)
+{
+	FVoxelVisBuffer VisBuffer;
+	VisBuffer.NormalizedHitDistance = ((Payload >> 24) & 0xFF) / float(0xFF);
+	VisBuffer.HitObjectId = Payload & 0xFFFFFF;
+
+	return VisBuffer;
+}
+
+uint3 ClipmapGridResolution;
+float3 VoxelCoordToUVScale;
+float3 VoxelCoordToUVBias;
+
+uint3 VoxelCoordToVisBufferTextureCoord(uint ClipmapIndex, uint3 VoxelCoord, uint DirectionIndex)
+{
+	float3 ClipmapUV = frac((VoxelCoord + 0.5f) * VoxelCoordToUVScale + VoxelCoordToUVBias);
+
+	uint3 TextureCoord = clamp(saturate(ClipmapUV) * ClipmapGridResolution, 0, ClipmapGridResolution - 1);
+	TextureCoord.y += ClipmapIndex * ClipmapGridResolution.y;
+	TextureCoord.z += DirectionIndex * ClipmapGridResolution.z;
+
+	return TextureCoord;
+}
+
+RWBuffer<uint> RWClearVisBufferIndirectArgBuffer;
+RWBuffer<uint> RWTraceSetupIndirectArgBuffer;
+RWBuffer<uint> RWTraceIndirectArgBuffer;
+
+[numthreads(1, 1, 1)]
+void ClearIndirectArgBuffersCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	if (DispatchThreadId.x == 0)
+	{
+		RWClearVisBufferIndirectArgBuffer[0] = 0;
+		RWClearVisBufferIndirectArgBuffer[1] = 1;
+		RWClearVisBufferIndirectArgBuffer[2] = 1;
+
+		RWTraceSetupIndirectArgBuffer[0] = 0;
+		RWTraceSetupIndirectArgBuffer[1] = 1;
+		RWTraceSetupIndirectArgBuffer[2] = 1;
+
+		RWTraceIndirectArgBuffer[0] = 0;
+		RWTraceIndirectArgBuffer[1] = 1;
+		RWTraceIndirectArgBuffer[2] = 1;
+	}
+}
+
+RWStructuredBuffer<uint> RWGridTileBuffer;
+RWTexture3D<uint> RWGridTileMaskTexture;
+
+Buffer<float4> UpdateBoundsBuffer;
+uint NumUpdateBounds;
+
+uint3 GridResolution;
+float3 GridCoordToWorldCenterScale;
+float3 GridCoordToWorldCenterBias;
+float3 TileWorldExtent;
+
+groupshared uint GroupInsideBounds;
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void BuildUpdateGridTilesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint3 GridCoord = GroupId.xyz;
+	uint ThreadId = GroupThreadId.x;
+	float3 GridWorldCenter = GridCoord * GridCoordToWorldCenterScale + GridCoordToWorldCenterBias;
+
+	if (ThreadId == 0)
+	{
+		GroupInsideBounds = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	LOOP
+	for (uint UpdateBoundsIndex = ThreadId; UpdateBoundsIndex < NumUpdateBounds; UpdateBoundsIndex += THREADGROUP_SIZE)
+	{
+		float3 UpdateBoundsCenter = UpdateBoundsBuffer[UpdateBoundsIndex * 2 + 0].xyz;
+		float3 UpdateBoundsExtent = UpdateBoundsBuffer[UpdateBoundsIndex * 2 + 1].xyz;
+
+		float DistanceSq = ComputeSquaredDistanceBetweenAABBs(UpdateBoundsCenter, UpdateBoundsExtent, GridWorldCenter, TileWorldExtent);
+		if (DistanceSq <= 0.0f)
+		{
+			GroupInsideBounds = 1;
+			break;
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (all(GridCoord < GridResolution) && ThreadId == 0)
+	{
+		if (GroupInsideBounds)
+		{
+			uint DestIndex;
+			InterlockedAdd(RWClearVisBufferIndirectArgBuffer[0], 1, DestIndex);
+			RWGridTileBuffer[DestIndex] = GridCoord.x | (GridCoord.y << 8) | (GridCoord.z << 16);
+		}
+
+		RWGridTileMaskTexture[GridCoord] = GroupInsideBounds;
+	}
+}
+
+RWTexture3D<uint> RWVoxelVisBuffer;
+StructuredBuffer<uint> UpdateTileBuffer;
+uint ClipmapIndex;
+
+[numthreads(VIS_BUFFER_TILE_SIZE, VIS_BUFFER_TILE_SIZE, VIS_BUFFER_TILE_SIZE * NUM_VOXEL_DIRECTIONS)]
+void ClearVisBufferCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint UpdateTileIndex = GroupId.x;
+	uint PackedUpdateTile = UpdateTileBuffer[UpdateTileIndex];
+
+	uint3 UpdateTileCoord;
+	UpdateTileCoord.x = PackedUpdateTile & 0xFF;
+	UpdateTileCoord.y = (PackedUpdateTile >> 8) & 0xFF;
+	UpdateTileCoord.z = (PackedUpdateTile >> 16) & 0xFF;
+
+	uint3 VoxelCoordOffset;
+	VoxelCoordOffset.x = GroupThreadId.x;
+	VoxelCoordOffset.y = GroupThreadId.y;
+	VoxelCoordOffset.z = GroupThreadId.z % VIS_BUFFER_TILE_SIZE;
+
+	uint DirectionIndex = GroupThreadId.z / VIS_BUFFER_TILE_SIZE;
+
+	uint3 VoxelCoord = UpdateTileCoord * VIS_BUFFER_TILE_SIZE + VoxelCoordOffset;
+
+	uint3 VisBufferTextureCoord = VoxelCoordToVisBufferTextureCoord(ClipmapIndex, VoxelCoord, DirectionIndex);
+	RWVoxelVisBuffer[VisBufferTextureCoord] = VIS_BUFFER_CLEAR;
+}
+
+RWStructuredBuffer<uint> RWObjectIndexBuffer;
+float3 VoxelClipmapWorldCenter;
+float3 VoxelClipmapWorldExtent;
+float MeshSDFRadiusThreshold;
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void CullToVoxelClipmapCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint ObjectIndex = DispatchThreadId.x;
+
+	if (ObjectIndex < NumSceneObjects)
+	{
+		float3 WorldObjectCenter = SceneObjectBounds[ObjectIndex * OBJECT_BOUNDS_STRIDE + 0].xyz;
+		float3 WorldObjectExtent = SceneObjectBounds[ObjectIndex * OBJECT_BOUNDS_STRIDE + 1].xyz;
+		float BoundsRadius = length(WorldObjectExtent);
+
+		BRANCH
+		if (BoundsRadius > MeshSDFRadiusThreshold)
+		{
+			float DistanceSq = ComputeSquaredDistanceBetweenAABBs(VoxelClipmapWorldCenter, VoxelClipmapWorldExtent, WorldObjectCenter, WorldObjectExtent);
+			if (DistanceSq <= 0.0f)
+			{
+				uint DestIndex;
+				InterlockedAdd(RWTraceSetupIndirectArgBuffer[0], 1, DestIndex);
+				RWObjectIndexBuffer[DestIndex] = ObjectIndex;
+			}
+		}
+	}
+}
+
+RWStructuredBuffer<uint> RWVoxelTraceAllocator;
+RWStructuredBuffer<uint2> RWVoxelTraceData;
+StructuredBuffer<uint> ObjectIndexBuffer;
+StructuredBuffer<uint> CullGridTileBuffer;
+
+float3 ConservativeRasterizationExtent;
+float3 ClipmapToUpdateGridScale;
+float3 ClipmapToUpdateGridBias;
+int3 UpdateGridResolution;
+
+Texture3D<uint> UpdateTileMaskTexture;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
+void SetupVoxelTracesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint IndexInObjectIndexBuffer = GroupId.x;
+	int3 UpdateGridBaseOffset = GroupThreadId.xyz * VIS_BUFFER_TILE_SIZE;
+	uint ObjectIndex = ObjectIndexBuffer[IndexInObjectIndexBuffer];
+
+	FDFObjectBounds DFObjectBounds = LoadDFObjectBounds(ObjectIndex);
+
+	int3 ObjectGridMin = (DFObjectBounds.Center - DFObjectBounds.BoxExtent - ConservativeRasterizationExtent) * ClipmapToUpdateGridScale + ClipmapToUpdateGridBias;
+	int3 ObjectGridMax = (DFObjectBounds.Center + DFObjectBounds.BoxExtent + ConservativeRasterizationExtent) * ClipmapToUpdateGridScale + ClipmapToUpdateGridBias;
+
+	ObjectGridMin = clamp(ObjectGridMin, UpdateGridBaseOffset, UpdateGridBaseOffset + VIS_BUFFER_TILE_SIZE);
+	ObjectGridMax = clamp(ObjectGridMax, UpdateGridBaseOffset, UpdateGridBaseOffset + VIS_BUFFER_TILE_SIZE);
+
+	if (all(ObjectGridMax > ObjectGridMin))
+	{
+		for (int PosZ = ObjectGridMin.z; PosZ < ObjectGridMax.z; ++PosZ)
+		{
+			for (int PosY = ObjectGridMin.y; PosY < ObjectGridMax.y; ++PosY)
+			{
+				for (int PosX = ObjectGridMin.x; PosX < ObjectGridMax.x; ++PosX)
+				{
+					const uint3 TileCoord = uint3(PosX, PosY, PosZ);
+					if (UpdateTileMaskTexture[TileCoord] > 0)
+					{
+						const uint3 TileCoord = uint3(PosX, PosY, PosZ);
+
+						uint WriteIndex;
+						InterlockedAdd(RWTraceIndirectArgBuffer[0], 1, WriteIndex);
+
+						RWVoxelTraceData[WriteIndex].x = TileCoord.x | (TileCoord.y << 8) | (TileCoord.z << 16);
+						RWVoxelTraceData[WriteIndex].y = ObjectIndex;
+					}
+				}
+			}
+		}
+	}
+}
+
+StructuredBuffer<uint2> VoxelTraceData;
+float3 GridMin;
+float3 GridVoxelSize;
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void VoxelTraceCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint ThreadIndex = GroupThreadId.x;
+
+	uint VoxelTraceIndex = GroupId.x;
+	uint PackedTileCoord = VoxelTraceData[VoxelTraceIndex].x;
+	uint ObjectIndex = VoxelTraceData[VoxelTraceIndex].y;
+
+	uint3 TileCoord;
+	TileCoord.x = PackedTileCoord & 0xFF;
+	TileCoord.y = (PackedTileCoord >> 8) & 0xFF;
+	TileCoord.z = (PackedTileCoord >> 16) & 0xFF;
+
+	for (uint TraceIndex = ThreadIndex; TraceIndex < 64 * NUM_VOXEL_DIRECTIONS; TraceIndex += 64)
+	{
+		uint DirectionIndex = TraceIndex % NUM_VOXEL_DIRECTIONS;
+		uint VoxelIndex = TraceIndex / NUM_VOXEL_DIRECTIONS;
+
+		uint3 VoxelCoord = TileCoord * VIS_BUFFER_TILE_SIZE;
+		VoxelCoord.x += VoxelIndex % VIS_BUFFER_TILE_SIZE;
+		VoxelCoord.y += (VoxelIndex / VIS_BUFFER_TILE_SIZE) % VIS_BUFFER_TILE_SIZE;
+		VoxelCoord.z += VoxelIndex / (VIS_BUFFER_TILE_SIZE * VIS_BUFFER_TILE_SIZE);
+
+		float3 VoxelMin = GridMin + GridVoxelSize * VoxelCoord;
+		float3 VoxelExtent = .5f * GridVoxelSize;
+		float3 VoxelCenter = VoxelMin + VoxelExtent;
+
+		float Sign = (DirectionIndex & 1) ? -1.0f : 1.0f;
+		uint Axis = DirectionIndex / 2;
+		float3 AxisDirection = Sign * float3(Axis == 0 ? 1.0f : 0.0f, Axis == 1 ? 1.0f : 0.0f, Axis == 2 ? 1.0f : 0.0f);
+		float3 RayStart = VoxelCenter - AxisDirection * VoxelExtent;
+		float3 RayEnd = RayStart + AxisDirection * 2 * VoxelExtent;
+		float RayLength = length(RayEnd - RayStart);
+
+		FConeTraceInput TraceInput;
+		TraceInput.Setup(RayStart, AxisDirection, 0, 0, 0, RayLength, 2.0f);
+		TraceInput.ConeStartRadius = length(AxisDirection * VoxelExtent);
+
+		FTraceMeshSDFResult TraceMeshSDFResult;
+		TraceMeshSDFResult.HitDistance = TraceInput.MaxTraceDistance;
+		TraceMeshSDFResult.HitObject = 0;
+
+		RayTraceSingleMeshSDF(
+			TraceInput.ConeOrigin,
+			TraceInput.ConeDirection,
+			TraceInput.TanConeAngle,
+			TraceInput.MinTraceDistance,
+			TraceInput.MaxTraceDistance,
+			ObjectIndex,
+			true,
+			0.0f,
+			TraceMeshSDFResult);
+
+		if (TraceMeshSDFResult.HitDistance < TraceInput.MaxTraceDistance)
+		{
+			uint VisBufferPayload = VIS_BUFFER_CLEAR;
+
+			if (TraceMeshSDFResult.bRayStartInsideGeometry)
+			{
+				VisBufferPayload = VIS_BUFFER_INVALID;
+			}
+			else
+			{
+				FVoxelVisBuffer VisBuffer;
+				VisBuffer.NormalizedHitDistance = saturate(TraceMeshSDFResult.HitDistance / TraceInput.MaxTraceDistance);
+				VisBuffer.HitObjectId = TraceMeshSDFResult.HitObject;
+				VisBufferPayload = EncodeVoxelVisBuffer(VisBuffer);
+			}
+
+			uint3 VisBufferTextureCoord = VoxelCoordToVisBufferTextureCoord(ClipmapIndex, VoxelCoord, DirectionIndex);
+			InterlockedMin(RWVoxelVisBuffer[VisBufferTextureCoord], VisBufferPayload);
+		}
+	}
+}
+
+RWStructuredBuffer<uint> RWCompactedVisBufferAllocator;
+RWStructuredBuffer<uint> RWCompactedVisBuffer;
+
+Texture3D<uint> VoxelVisBuffer;
+
+groupshared uint GroupCompactedVisBuffer[VIS_BUFFER_SHADING_WAVE_SIZE * NUM_VOXEL_DIRECTIONS];
+groupshared uint GroupCompactedVisBufferAllocator;
+groupshared uint GroupCompactedGlobalWriteOffset;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
+void CompactVisBufferCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	const uint LinearGroupThreadId = GroupThreadId.x + GroupThreadId.y * THREADGROUP_SIZE + GroupThreadId.z * THREADGROUP_SIZE * THREADGROUP_SIZE;
+	if (LinearGroupThreadId == 0)
+	{
+		GroupCompactedVisBufferAllocator = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	uint3 VoxelCoord = DispatchThreadId;
+	if (all(VoxelCoord < ClipmapGridResolution))
+	{
+		for (uint DirectionIndex = 0; DirectionIndex < NUM_VOXEL_DIRECTIONS; ++DirectionIndex)
+		{
+			uint3 VisBufferTextureCoord = VoxelCoordToVisBufferTextureCoord(ClipmapIndex, VoxelCoord, DirectionIndex);
+			uint VisBufferPayload = VoxelVisBuffer.Load(int4(VisBufferTextureCoord, 0)).x;
+
+			if (VisBufferPayload != VIS_BUFFER_INVALID && VisBufferPayload != VIS_BUFFER_CLEAR)
+			{
+				uint VisBufferIndex = 0;
+				InterlockedAdd(GroupCompactedVisBufferAllocator, 1, VisBufferIndex);
+
+				uint PackedVisBuffer = VoxelCoord.x | (VoxelCoord.y << 8) | (VoxelCoord.z << 16) | (DirectionIndex << 24);
+				GroupCompactedVisBuffer[VisBufferIndex] = PackedVisBuffer;
+			}
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	uint NumVisBufferShadingWaves = (GroupCompactedVisBufferAllocator + VIS_BUFFER_SHADING_WAVE_SIZE - 1) / VIS_BUFFER_SHADING_WAVE_SIZE;
+
+	if (LinearGroupThreadId == 0 && NumVisBufferShadingWaves > 0)
+	{
+		InterlockedAdd(RWCompactedVisBufferAllocator[0], NumVisBufferShadingWaves, GroupCompactedGlobalWriteOffset);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	for (uint WaveIndex = 0; WaveIndex < NumVisBufferShadingWaves; ++WaveIndex)
+	{
+		uint VisBufferIndex = WaveIndex * VIS_BUFFER_SHADING_WAVE_SIZE + LinearGroupThreadId;
+		RWCompactedVisBuffer[GroupCompactedGlobalWriteOffset * VIS_BUFFER_SHADING_WAVE_SIZE + VisBufferIndex] = VisBufferIndex < GroupCompactedVisBufferAllocator ? GroupCompactedVisBuffer[VisBufferIndex] : VIS_BUFFER_CLEAR;
+	}
+}
+
+RWBuffer<uint3> RWCompactedVisBufferIndirectArguments;
+StructuredBuffer<uint> CompactedVisBufferAllocator;
+
+[numthreads(1, 1, 1)]
+void SetupVisBufferShadingCS()
+{
+	RWCompactedVisBufferIndirectArguments[0] = CompactedVisBufferAllocator[0];
+	RWCompactedVisBufferIndirectArguments[1] = 1;
+	RWCompactedVisBufferIndirectArguments[2] = 1;
+}
+
+RWTexture3D<float4> RWVoxelLighting;
+uint3 OutputGridResolution;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
+void ClearVoxelLightingClipmapCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint3 OutputCoord = DispatchThreadId;
+
+	if (all(OutputCoord < OutputGridResolution))
+	{
+		uint3 VoxelLightingCoord = OutputCoord + uint3(0, ClipmapIndex * ClipmapGridResolution.y, 0);
+		RWVoxelLighting[VoxelLightingCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	}
+}
+
+StructuredBuffer<uint> CompactedVisBuffer;
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void VisBufferShadingCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint GlobalGroupIndex = GroupId.x;
+	const uint LinearGroupThreadId = GroupThreadId.x + GroupThreadId.y * THREADGROUP_SIZE + GroupThreadId.z * THREADGROUP_SIZE * THREADGROUP_SIZE;
+
+	if (GlobalGroupIndex < CompactedVisBufferAllocator[0])
+	{
+		uint CompactedVisBufferValue = CompactedVisBuffer[GlobalGroupIndex * THREADGROUP_SIZE + LinearGroupThreadId];
+		if (CompactedVisBufferValue != VIS_BUFFER_CLEAR)
+		{
+			uint3 VoxelCoord;
+			VoxelCoord.x = CompactedVisBufferValue & 0xFF;
+			VoxelCoord.y = (CompactedVisBufferValue >> 8) & 0xFF;
+			VoxelCoord.z = (CompactedVisBufferValue >> 16) & 0xFF;
+			uint DirectionIndex = (CompactedVisBufferValue >> 24) & 0xFF;
+
+			float3 VoxelMin = GridMin + GridVoxelSize * VoxelCoord;
+			float3 VoxelExtent = .5f * GridVoxelSize;
+			float3 VoxelCenter = VoxelMin + VoxelExtent;
+
+			float3 Lighting = 0;
+			float Transparency = 1;
+
+			uint3 VisBufferTextureCoord = VoxelCoordToVisBufferTextureCoord(ClipmapIndex, VoxelCoord, DirectionIndex);
+			uint VisBufferPayload = VoxelVisBuffer.Load(int4(VisBufferTextureCoord, 0)).x;
+
+			if (VisBufferPayload != VIS_BUFFER_INVALID && VisBufferPayload != VIS_BUFFER_CLEAR)
+			{
+				float Sign = (DirectionIndex & 1) ? -1.0f : 1.0f;
+				uint Axis = DirectionIndex / 2;
+				float3 RayDirection = Sign * float3(Axis == 0 ? 1.0f : 0.0f, Axis == 1 ? 1.0f : 0.0f, Axis == 2 ? 1.0f : 0.0f);
+				float3 RayStart = VoxelCenter - RayDirection * VoxelExtent;
+				float3 RayEnd = RayStart + RayDirection * 2 * VoxelExtent;
+				float RayLength = length(RayEnd - RayStart);
+				float ConeStartRadius = length(RayDirection * VoxelExtent);
+
+				FVoxelVisBuffer VisBuffer = DecodeVoxelVisBuffer(VisBufferPayload);
+				FTraceMeshSDFResult TraceMeshSDFResult;
+				TraceMeshSDFResult.HitDistance = RayLength * VisBuffer.NormalizedHitDistance;
+				TraceMeshSDFResult.HitObject = VisBuffer.HitObjectId;
+
+				FTraceMeshSDFDerivedData TraceSDFData = CalculateMeshSDFDerivedData(RayStart, RayDirection, RayLength, false, TraceMeshSDFResult);
+
+				float3 InterpolatePosition = RayStart + RayDirection * TraceMeshSDFResult.HitDistance;
+
+				//@todo - compute based on SDF voxel size, or card texel size
+				float CardInterpolateDepthVisibilityRadius = 10.0f;
+				float InterpolateRadius = VoxelExtent.x;
+				uint2 ScreenCoord = uint2(0, 0);
+				bool bHiResSurface = false;
+				uint AtlasId = FINAL_LIGHTING_ATLAS_ID;
+
+				FSurfaceCacheSample SurfaceCacheSample = SampleLumenMeshCards(
+					ScreenCoord,
+					TraceSDFData.SceneInstanceIndex,
+					InterpolatePosition,
+					-RayDirection,
+					InterpolateRadius,
+					TraceSDFData.bAccurateHit,
+					CardInterpolateDepthVisibilityRadius,
+					bHiResSurface,
+					AtlasId);
+
+				uint3 WriteCoord = uint3(VoxelCoord.x, ClipmapIndex * ClipmapGridResolution.y + VoxelCoord.y, DirectionIndex * ClipmapGridResolution.z + VoxelCoord.z);
+				RWVoxelLighting[WriteCoord] = float4(SurfaceCacheSample.Lighting, SurfaceCacheSample.Opacity);
+			}
+		}
+	}
+}
