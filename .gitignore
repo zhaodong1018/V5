@@ -244,4 +244,9 @@ Engine/Extras/ThirdPartyNotUE/SDKs/HostLinux/**
 
 # Ignore test json data files in NeuralNetworkInterface
 /Engine/Plugins/Experimental/NeuralNetworkInference/Source/ThirdParty/Deps/json/**
+
+#ignore auto-generated steam_appid file
 Engine/Binaries/Win64/steam_appid.txt
+
+#ignore Marketplace Plugins Folder
+Engine/Plugins/Marketplace
