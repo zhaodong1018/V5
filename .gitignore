@@ -250,3 +250,6 @@ Engine/Binaries/Win64/steam_appid.txt
 
 #ignore Marketplace Plugins Folder
 Engine/Plugins/Marketplace
+
+#Rider for Unreal
+Engine/Plugins/Developer/RiderLink
