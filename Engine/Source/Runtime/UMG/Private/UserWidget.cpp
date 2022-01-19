@@ -1416,7 +1416,7 @@ void UUserWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 				AnimationTickManager->OnWidgetTicked(this);
 			}
 
-			if (!CVarUserWidgetUseParallelAnimation.GetValueOnGameThread())
+			//if (!CVarUserWidgetUseParallelAnimation.GetValueOnGameThread())
 			{
 				TickActionsAndAnimation(InDeltaTime);
 				PostTickActionsAndAnimation(InDeltaTime);
